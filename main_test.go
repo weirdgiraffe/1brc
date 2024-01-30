@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-const testFile = "../../gunnarmorling/1brc/measurements1B.txt"
+const testFile = "../../gunnarmorling/1brc/measurements.txt"
 
 // on my machine on average it takes 4-5.5 seconds
 // to read the test file
@@ -28,5 +28,12 @@ func TestReadFile(t *testing.T) {
 			}
 			t.Fatalf("failed read file: %v", err)
 		}
+	}
+}
+
+func TestSolve(t *testing.T) {
+	err := Solve(testFile)
+	if err != nil {
+		t.Fatalf("failed to solve: %v", err)
 	}
 }
