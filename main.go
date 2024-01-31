@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"unsafe"
 )
 
@@ -24,7 +26,7 @@ const valueSep = ';'
 var ErrSeparatorNotFound = errors.New("separator not found")
 
 type Item struct {
-	name  []byte
+	name  string
 	value float64
 }
 
@@ -33,21 +35,23 @@ func ParseLine(line []byte) (out Item, err error) {
 	if sep == -1 {
 		return out, ErrSeparatorNotFound
 	}
-	_ = line[sep+1:] // reduce amount of bound checks
-	out.name = line[:sep]
+
+	out.name = string(line[:sep])
 	out.value, err = ValueToFloat(line[sep+1:])
 	return out, err
 }
 
 type Info struct {
+	Name  string
 	Min   float64
 	Max   float64
 	Sum   float64
-	Count int
+	Count float64
 }
 
 func InfoFromItem(item Item) Info {
 	return Info{
+		Name:  item.name,
 		Min:   item.value,
 		Max:   item.value,
 		Sum:   item.value,
@@ -65,23 +69,71 @@ func (info *Info) Update(item Item) {
 	info.Count += 1
 }
 
-func HandleLine(line []byte, dict map[string]Info) error {
+type InfoStore struct {
+	infos []Info
+}
+
+func NewInfoStore() *InfoStore {
+	return &InfoStore{
+		infos: make([]Info, 0, 1e4),
+	}
+}
+
+func (store *InfoStore) At(i int) *Info {
+	return &store.infos[i]
+}
+
+func (store *InfoStore) Update(item Item) {
+	n := len(store.infos)
+	i := sort.Search(n, func(i int) bool {
+		return strings.Compare(store.At(i).Name, item.name) >= 0
+	})
+
+	if i == n {
+		// all items are smaller than item, so add item to the end
+		info := InfoFromItem(item)
+		store.infos = append(store.infos, info)
+		return
+	}
+
+	found := store.At(i)
+	if found.Name == item.name {
+		found.Update(item)
+		return
+	}
+
+	// insert item at i
+	info := InfoFromItem(item)
+	store.infos = append(store.infos, Info{})
+	copy(store.infos[i+1:], store.infos[i:n])
+	store.infos[i] = info
+}
+
+func (store *InfoStore) Print() {
+	fmt.Print("{")
+	for i, info := range store.infos {
+		if i != 0 {
+			fmt.Print(", ")
+		}
+		fmt.Printf("%s=%.1f/%.1f/%.1f",
+			info.Name,
+			info.Min,
+			info.Sum/info.Count,
+			info.Max)
+	}
+	fmt.Println("}")
+}
+
+func HandleLine(line []byte, store *InfoStore) error {
 	item, err := ParseLine(line)
 	if err != nil {
 		return fmt.Errorf("failed to parse line: %w", err)
 	}
-	name := unsafe.String(unsafe.SliceData(item.name), len(item.name))
-	info, ok := dict[name]
-	if ok {
-		info.Update(item)
-	} else {
-		info = InfoFromItem(item)
-	}
-	dict[name] = info
+	store.Update(item)
 	return nil
 }
 
-func HandleBuf(buf []byte, dict map[string]Info) (consumed int, err error) {
+func HandleBuf(buf []byte, store *InfoStore) (consumed int, err error) {
 	for {
 		le := bytes.IndexByte(buf[consumed:], '\n')
 		if le == -1 {
@@ -89,7 +141,7 @@ func HandleBuf(buf []byte, dict map[string]Info) (consumed int, err error) {
 			return consumed, nil
 		}
 		line := buf[consumed : consumed+le]
-		err = HandleLine(line, dict)
+		err = HandleLine(line, store)
 		if err != nil {
 			return consumed, fmt.Errorf("failed to parse line %q: %w", line, err)
 		}
@@ -98,8 +150,7 @@ func HandleBuf(buf []byte, dict map[string]Info) (consumed int, err error) {
 }
 
 func Solve(filename string) error {
-	memHint := int(1e4)
-	var dict = make(map[string]Info, memHint)
+	store := NewInfoStore()
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -114,12 +165,14 @@ func Solve(filename string) error {
 		n, err := file.Read(buf[offt:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				fmt.Printf("store has %d items\n", len(store.infos))
+				store.Print()
 				return nil
 			}
 			return fmt.Errorf("failed to read file: %w", err)
 		}
 
-		consumed, err := HandleBuf(buf[:offt+n], dict)
+		consumed, err := HandleBuf(buf[:offt+n], store)
 		if err != nil {
 			return fmt.Errorf("failed to parse buf: %w", err)
 		}
