@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,229 +9,248 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
 
-// after profiling it appears that strconv.ParseFloat
-// is taking way to much time for our use case
-func ParseFloat(value []byte) float64 {
-	const minus = '-'
-	f := 0.0
+// usage of strconv.ParseFloat is way to expensive
+// for this program, so just optimize it for the
+// specific format.
+// NOTE: it may panic on unexpected input
+func ParseFloat(value []byte) (f float64) {
 	m := 1.0
 	i := 0
-	if value[i] == minus {
+	if value[i] == '-' {
 		m = -1.0
 		i++
 	}
 	n := len(value)
 	for ; i < n-2; i++ {
-		f *= 10
-		f += float64(value[i] - '0')
+		f = (f * 10.0) + float64(value[i]-'0')
 	}
-	f += float64(value[n-1]-'0') / 10
-	return m * f
+	return m * (f + float64(value[n-1]-'0')/10.0)
 }
 
-const (
-	valueSep = ';'
-	endLine  = '\n'
-)
+const shortLineLen = 200
 
-var ErrSeparatorNotFound = errors.New("separator not found")
-
-type Item struct {
-	name  []byte
-	value float64
-}
-
-func ParseLine(line []byte) (out Item, err error) {
-	sep := indexByte(line, valueSep)
-	if sep == -1 {
-		return out, ErrSeparatorNotFound
-	}
-
-	out.name = line[:sep]
-	out.value = ParseFloat(line[sep+1:])
-	return out, err
-}
-
-type Info struct {
-	Min   float64
-	Max   float64
-	Sum   float64
-	Count float64
-}
-
-func InfoFromItem(item Item) *Info {
-	return &Info{
-		Min:   item.value,
-		Max:   item.value,
-		Sum:   item.value,
-		Count: 1,
-	}
-}
-func (info *Info) Update(value float64) {
-	info.Sum += value
-	info.Count += 1
-	if info.Min > value {
-		info.Min = value
-	}
-	if info.Max < value {
-		info.Max = value
-	}
-}
-
-func (info *Info) Merge(other *Info) {
-	if info.Min > other.Min {
-		info.Min = other.Min
-	}
-	if info.Max < other.Max {
-		info.Max = other.Max
-	}
-	info.Sum += other.Sum
-	info.Count += other.Count
-}
-
-type InfoStore struct {
-	m map[string]*Info
-}
-
-func NewInfoStore() *InfoStore {
-	return &InfoStore{
-		m: make(map[string]*Info, 1000),
-	}
-}
-
-func (store *InfoStore) Merge(name string, other *Info) {
-	if mine, ok := store.m[name]; ok {
-		mine.Merge(other)
-	} else {
-		store.m[name] = other
-	}
-}
-
-func (store *InfoStore) Update(item Item) {
-	if info, ok := store.m[string(item.name)]; ok {
-		info.Update(item.value)
-	} else {
-		name := string(item.name)
-		store.m[name] = InfoFromItem(item)
-	}
-}
-
-func (store *InfoStore) Print() {
-	type InfoWithName struct {
-		*Info
-		Name string
-	}
-	l := make([]InfoWithName, 0, len(store.m))
-	for name, info := range store.m {
-		l = append(l, InfoWithName{
-			Info: info,
-			Name: name,
-		})
-	}
-	sort.Slice(l, func(i, j int) bool {
-		return l[i].Name < l[j].Name
-	})
-
-	os.Stdout.Write([]byte{'{'})
-	for i, info := range l {
-		if i != 0 {
-			os.Stdout.Write([]byte{','})
-		}
-		fmt.Printf("%s=%.1f/%.1f/%.1f",
-			info.Name,
-			info.Min,
-			info.Sum/info.Count,
-			info.Max)
-	}
-	os.Stdout.Write([]byte{'}', '\n'})
-}
-
-func HandleLine(line []byte, store *InfoStore) error {
-	item, err := ParseLine(line)
-	if err != nil {
-		return fmt.Errorf("failed to parse line %q: %w", line, err)
-	}
-	store.Update(item)
-	return nil
-}
-
-func indexByte(b []byte, c byte) int {
-	for i, bc := range b {
-		if bc == c {
+// bytes.IndexByte seems to have some native implementation
+// so it won't get inlined and is slower based on benchamarks
+func lineEndIndex(b []byte) int {
+	// NOTE: as line must have city name, min start offset is 5 (X;Y.Z)
+	for i := 5; i < len(b); i++ {
+		if b[i] == '\n' {
 			return i
 		}
 	}
 	return -1
 }
 
-func HandlePage(page *Page, store *InfoStore) error {
-	buf := page.b[:page.n]
-	consumed := 0
+func ParseLine(line []byte) (name []byte, value float64) {
+	// NOTE: normally it's way less digits than letters
+	sep := bytes.LastIndexByte(line, ';')
+	if sep == -1 {
+		panic("value separator not found")
+	}
+	name = line[:sep]
+	value = ParseFloat(line[sep+1:])
+	return name, value
+}
 
+type Stats struct {
+	Min   float64
+	Max   float64
+	Sum   float64
+	Count float64
+}
+
+func NewStats(value float64) *Stats {
+	return &Stats{
+		Min:   value,
+		Max:   value,
+		Sum:   value,
+		Count: 1,
+	}
+}
+
+func (st *Stats) Update(value float64) {
+	if st.Min > value {
+		st.Min = value
+	}
+	if st.Max < value {
+		st.Max = value
+	}
+	st.Sum += value
+	st.Count += 1
+}
+
+func (st *Stats) Merge(other *Stats) {
+	if st.Min > other.Min {
+		st.Min = other.Min
+	}
+	if st.Max < other.Max {
+		st.Max = other.Max
+	}
+	st.Sum += other.Sum
+	st.Count += other.Count
+}
+
+type Calc struct {
+	cities map[string]*Stats
+}
+
+func NewCalc() *Calc {
+	return &Calc{
+		cities: make(map[string]*Stats, 1000),
+	}
+}
+
+func (c *Calc) Update(name []byte, value float64) {
+	if st, ok := c.cities[string(name)]; ok {
+		st.Update(value)
+	} else {
+		name := string(name)
+		c.cities[name] = NewStats(value)
+	}
+}
+
+func (c *Calc) Merge(name string, other *Stats) {
+	if mine, ok := c.cities[name]; ok {
+		mine.Merge(other)
+	} else {
+		c.cities[name] = other
+	}
+}
+
+func (c *Calc) HandleLine(line []byte) {
+	c.Update(ParseLine(line))
+}
+
+func (c *Calc) HandlePage(page *Page) {
+	buf := page.Bytes()
+
+	consumed := 0
 	for {
-		le := indexByte(buf[consumed:], '\n')
+		le := lineEndIndex(buf[consumed:])
 		if le == -1 {
 			break
 		}
-
-		err := HandleLine(buf[consumed:consumed+le], store)
-		if err != nil {
-			return err
-		}
+		c.HandleLine(buf[consumed : consumed+le])
 		consumed += le + 1
 	}
+	c.HandleLine(buf[consumed:])
 
-	err := HandleLine(buf[consumed:], store)
-	if err != nil {
-		return err
-	}
-
-	page.n = pageSize
-	pagePool.Put(page)
-	return nil
+	page.Put()
 }
 
-func DoWork(pages <-chan *Page, store *InfoStore) error {
+func (c *Calc) HandlePages(pages <-chan *Page) {
 	for page := range pages {
-		err := HandlePage(page, store)
-		if err != nil {
-			return err
-		}
+		c.HandlePage(page)
 	}
-	return nil
 }
 
-func MergeStores(l []*InfoStore) *InfoStore {
-	store := NewInfoStore()
-	for i := range l {
-		for name, info := range l[i].m {
-			store.Merge(name, info)
-		}
+func (c *Calc) WriteResults(w io.Writer) {
+	type NamedStats struct {
+		*Stats
+		Name string
 	}
-	return store
+	l := make([]NamedStats, 0, len(c.cities))
+	for name, st := range c.cities {
+		l = append(l, NamedStats{
+			Stats: st,
+			Name:  name,
+		})
+	}
+	sort.Slice(l, func(i, j int) bool {
+		return l[i].Name < l[j].Name
+	})
+
+	w.Write([]byte{'{'})
+	for i, st := range l {
+		if i != 0 {
+			w.Write([]byte{','})
+		}
+		fmt.Fprintf(w, "%s=%.1f/%.1f/%.1f",
+			st.Name,
+			st.Min,
+			st.Sum/st.Count,
+			st.Max)
+	}
+	w.Write([]byte("}\n"))
 }
 
 var pageSize = os.Getpagesize()
 var pagePool = sync.Pool{
 	New: func() any {
 		p := Page{
-			b: make([]byte, pageSize),
-			n: pageSize,
+			buf: make([]byte, pageSize),
+			n:   pageSize,
 		}
 		return &p
 	},
 }
 
 type Page struct {
-	b []byte
-	n int
+	buf []byte
+	n   int
 }
 
-func Solve(filename string) error {
+func GetPage() *Page {
+	return pagePool.Get().(*Page)
+}
+
+func (p Page) Bytes() []byte {
+	return p.buf[:p.n]
+}
+
+func (p *Page) Put() {
+	p.n = pageSize
+	pagePool.Put(p)
+}
+
+func ReadPages(r io.Reader, capacity int) <-chan *Page {
+	pages := make(chan *Page, capacity)
+	go func() {
+		defer close(pages)
+
+		prefix := make([]byte, 0, 100)
+		for {
+			p := GetPage()
+			buf := p.buf
+
+			copy(buf, prefix)
+			offt := len(prefix)
+			prefix = prefix[:0]
+
+			n, err := r.Read(buf[offt:])
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				panic(err)
+			}
+
+			i := bytes.LastIndexByte(buf[:offt+n], '\n')
+			if i != -1 {
+				prefix = append(prefix, buf[i+1:offt+n]...)
+				p.n = i
+			}
+
+			pages <- p
+		}
+
+	}()
+	return pages
+}
+
+func MergeParts(l []*Calc) *Calc {
+	c := NewCalc()
+	for i := range l {
+		for name, info := range l[i].cities {
+			c.Merge(name, info)
+		}
+	}
+	return c
+}
+
+func Calculate(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
@@ -240,64 +258,29 @@ func Solve(filename string) error {
 	defer file.Close()
 
 	workers := runtime.GOMAXPROCS(-1)
-	pages := make(chan *Page, 10*workers)
-	eg, ectx := errgroup.WithContext(context.Background())
+	pages := ReadPages(file, 10*workers)
+	parts := make([]*Calc, workers)
 
-	stores := make([]*InfoStore, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
 	for i := 0; i < workers; i++ {
-		store := NewInfoStore()
-		stores[i] = store
-		eg.Go(func() error {
-			return DoWork(pages, store)
-		})
+		c := NewCalc()
+		parts[i] = c
+		go func() {
+			defer wg.Done()
+			c.HandlePages(pages)
+		}()
 	}
+	wg.Wait()
 
-	eg.Go(func() (err error) {
-		defer close(pages)
-		prefix := make([]byte, 0, 100)
-		var n int
-		for {
-			p := pagePool.Get().(*Page)
-			buf := p.b
-
-			copy(buf, prefix)
-			offt := len(prefix)
-			prefix = prefix[:0]
-
-			n, err = file.Read(buf[offt:])
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					return nil
-				}
-			}
-
-			i := bytes.LastIndexByte(buf[:offt+n], endLine)
-			if i != -1 {
-				prefix = append(prefix, buf[i+1:offt+n]...)
-				p.n = i
-			}
-
-			select {
-			case <-ectx.Done():
-				return ectx.Err()
-			case pages <- p:
-			}
-		}
-	})
-
-	err = eg.Wait()
-	if err != nil {
-		return fmt.Errorf("failed to solve: %w", err)
-	}
-
-	store := MergeStores(stores)
-	store.Print()
+	c := MergeParts(parts)
+	c.WriteResults(os.Stdout)
 	return nil
 }
 
 func main() {
 	filename := os.Args[1]
-	if err := Solve(filename); err != nil {
+	if err := Calculate(filename); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to solve: %v\n", err)
 		os.Exit(1)
 	}

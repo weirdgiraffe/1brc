@@ -33,8 +33,8 @@ func TestReadFile(t *testing.T) {
 
 const bigFile = "../../gunnarmorling/1brc/measurements.txt"
 
-func TestSolve(t *testing.T) {
-	err := Solve(bigFile)
+func TestCalculate(t *testing.T) {
+	err := Calculate(bigFile)
 	if err != nil {
 		t.Fatalf("failed to solve: %v", err)
 	}
@@ -42,9 +42,9 @@ func TestSolve(t *testing.T) {
 
 const smallFile = "../../gunnarmorling/1brc/measurements1K.txt"
 
-func BenchmarkSolve(b *testing.B) {
+func BenchmarkCalculate(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		err := Solve(smallFile)
+		err := Calculate(smallFile)
 		if err != nil {
 			b.Fatalf("failed to solve: %v", err)
 		}
