@@ -47,7 +47,7 @@ type Item struct {
 }
 
 func ParseLine(line []byte) (out Item, err error) {
-	sep := bytes.IndexByte(line, valueSep)
+	sep := indexByte(line, valueSep)
 	if sep == -1 {
 		return out, ErrSeparatorNotFound
 	}
@@ -72,15 +72,15 @@ func InfoFromItem(item Item) *Info {
 		Count: 1,
 	}
 }
-func (info *Info) Update(item Item) {
-	if info.Min > item.value {
-		info.Min = item.value
-	}
-	if info.Max < item.value {
-		info.Max = item.value
-	}
-	info.Sum += item.value
+func (info *Info) Update(value float64) {
+	info.Sum += value
 	info.Count += 1
+	if info.Min > value {
+		info.Min = value
+	}
+	if info.Max < value {
+		info.Max = value
+	}
 }
 
 func (info *Info) Merge(other *Info) {
@@ -114,7 +114,7 @@ func (store *InfoStore) Merge(name string, other *Info) {
 
 func (store *InfoStore) Update(item Item) {
 	if info, ok := store.m[string(item.name)]; ok {
-		info.Update(item)
+		info.Update(item.value)
 	} else {
 		name := string(item.name)
 		store.m[name] = InfoFromItem(item)
@@ -137,10 +137,10 @@ func (store *InfoStore) Print() {
 		return l[i].Name < l[j].Name
 	})
 
-	fmt.Print("{")
+	os.Stdout.Write([]byte{'{'})
 	for i, info := range l {
 		if i != 0 {
-			fmt.Print(", ")
+			os.Stdout.Write([]byte{','})
 		}
 		fmt.Printf("%s=%.1f/%.1f/%.1f",
 			info.Name,
@@ -148,7 +148,7 @@ func (store *InfoStore) Print() {
 			info.Sum/info.Count,
 			info.Max)
 	}
-	fmt.Println("}")
+	os.Stdout.Write([]byte{'}', '\n'})
 }
 
 func HandleLine(line []byte, store *InfoStore) error {
@@ -160,11 +160,21 @@ func HandleLine(line []byte, store *InfoStore) error {
 	return nil
 }
 
+func indexByte(b []byte, c byte) int {
+	for i, bc := range b {
+		if bc == c {
+			return i
+		}
+	}
+	return -1
+}
+
 func HandlePage(page *Page, store *InfoStore) error {
 	buf := page.b[:page.n]
 	consumed := 0
+
 	for {
-		le := bytes.IndexByte(buf[consumed:], '\n')
+		le := indexByte(buf[consumed:], '\n')
 		if le == -1 {
 			break
 		}
