@@ -8,9 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"unsafe"
 
@@ -89,11 +87,13 @@ func (info *Info) Merge(other Info) {
 }
 
 type InfoStore struct {
+	m     map[string]int
 	infos []Info
 }
 
 func NewInfoStore() *InfoStore {
 	return &InfoStore{
+		m:     make(map[string]int, 1e3),
 		infos: make([]Info, 0, 1e3),
 	}
 }
@@ -103,56 +103,22 @@ func (store *InfoStore) At(i int) *Info {
 }
 
 func (store *InfoStore) Merge(info Info) {
-	n := len(store.infos)
-	i := sort.Search(n, func(i int) bool {
-		return strings.Compare(store.At(i).Name, info.Name) >= 0
-	})
-
-	if i == n {
-		// all items are smaller than item, so add item to the end
+	if i, ok := store.m[info.Name]; ok {
+		store.At(i).Merge(info)
+	} else {
 		store.infos = append(store.infos, info)
-		return
+		store.m[info.Name] = len(store.infos) - 1
 	}
-
-	found := store.At(i)
-	if found.Name == info.Name {
-		found.Merge(info)
-		return
-	}
-
-	// insert item at i
-	store.infos = append(store.infos, Info{})
-	copy(store.infos[i+1:], store.infos[i:n])
-	store.infos[i] = info
 }
 
 func (store *InfoStore) Update(item Item) {
-	n := len(store.infos)
-
-	name := unsafe.String(unsafe.SliceData(item.name), len(item.name))
-
-	i := sort.Search(n, func(i int) bool {
-		return strings.Compare(store.At(i).Name, name) >= 0
-	})
-
-	if i == n {
-		// all items are smaller than item, so add item to the end
+	if i, ok := store.m[string(item.name)]; ok {
+		store.At(i).Update(item)
+	} else {
 		info := InfoFromItem(item)
 		store.infos = append(store.infos, info)
-		return
+		store.m[info.Name] = len(store.infos) - 1
 	}
-
-	found := store.At(i)
-	if found.Name == name {
-		found.Update(item)
-		return
-	}
-
-	// insert item at i
-	info := InfoFromItem(item)
-	store.infos = append(store.infos, Info{})
-	copy(store.infos[i+1:], store.infos[i:n])
-	store.infos[i] = info
 }
 
 func (store *InfoStore) Print() {
