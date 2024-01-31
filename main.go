@@ -26,7 +26,10 @@ func ValueToFloat(value []byte) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
-const valueSep = ';'
+const (
+	valueSep = ';'
+	endLine  = '\n'
+)
 
 var ErrSeparatorNotFound = errors.New("separator not found")
 
@@ -153,7 +156,6 @@ func (store *InfoStore) Update(item Item) {
 }
 
 func (store *InfoStore) Print() {
-	return
 	fmt.Print("{")
 	for i, info := range store.infos {
 		if i != 0 {
@@ -171,48 +173,46 @@ func (store *InfoStore) Print() {
 func HandleLine(line []byte, store *InfoStore) error {
 	item, err := ParseLine(line)
 	if err != nil {
-		return fmt.Errorf("failed to parse line: %w", err)
+		return fmt.Errorf("failed to parse line %q: %w", line, err)
 	}
 	store.Update(item)
-
-	line = line[:0]
-	linePool.Put(&line)
 	return nil
 }
 
-func DoWork(lines <-chan []byte, store *InfoStore) error {
-	for line := range lines {
-		err := HandleLine(line, store)
+func HandlePage(page *Page, store *InfoStore) error {
+	buf := page.b[:page.n]
+	consumed := 0
+	for {
+		le := bytes.IndexByte(buf[consumed:], '\n')
+		if le == -1 {
+			break
+		}
+
+		err := HandleLine(buf[consumed:consumed+le], store)
+		if err != nil {
+			return err
+		}
+		consumed += le + 1
+	}
+
+	err := HandleLine(buf[consumed:], store)
+	if err != nil {
+		return err
+	}
+
+	page.n = pageSize
+	pagePool.Put(page)
+	return nil
+}
+
+func DoWork(pages <-chan *Page, store *InfoStore) error {
+	for page := range pages {
+		err := HandlePage(page, store)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-var linePool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 100)
-		return &b
-	},
-}
-
-func HandleBuf(buf []byte, out chan<- []byte) (consumed int, err error) {
-	for {
-		le := bytes.IndexByte(buf[consumed:], '\n')
-		if le == -1 {
-			debugf("line end not found\n")
-			return consumed, nil
-		}
-
-		bp := linePool.Get().(*[]byte)
-		b := *bp
-		b = append(b, buf[consumed:consumed+le]...)
-		// b := make([]byte, le)
-		// copy(b, buf[consumed:consumed+le])
-		out <- b
-		consumed += le + 1
-	}
 }
 
 func MergeStores(l []*InfoStore) *InfoStore {
@@ -225,6 +225,22 @@ func MergeStores(l []*InfoStore) *InfoStore {
 	return store
 }
 
+var pageSize = os.Getpagesize()
+var pagePool = sync.Pool{
+	New: func() any {
+		p := Page{
+			b: make([]byte, pageSize),
+			n: pageSize,
+		}
+		return &p
+	},
+}
+
+type Page struct {
+	b []byte
+	n int
+}
+
 func Solve(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -233,44 +249,54 @@ func Solve(filename string) error {
 	defer file.Close()
 
 	workers := runtime.GOMAXPROCS(-1)
-	lines := make(chan []byte, 1000*workers)
-	eg, _ := errgroup.WithContext(context.Background())
+	pages := make(chan *Page, 10*workers)
+	eg, ectx := errgroup.WithContext(context.Background())
 
 	stores := make([]*InfoStore, workers)
 	for i := 0; i < workers; i++ {
 		store := NewInfoStore()
 		stores[i] = store
 		eg.Go(func() error {
-			return DoWork(lines, store)
+			return DoWork(pages, store)
 		})
 	}
 
-	pageSize := os.Getpagesize()
-	buf := make([]byte, pageSize)
-	offt := 0
-	for {
+	eg.Go(func() (err error) {
+		defer close(pages)
+		prefix := make([]byte, 0, 100)
 		var n int
-		n, err = file.Read(buf[offt:])
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				close(lines)
-				_ = eg.Wait()
-				break
-			}
-			close(lines)
-			_ = eg.Wait()
-			return fmt.Errorf("failed to read file: %w", err)
-		}
+		for {
+			p := pagePool.Get().(*Page)
+			buf := p.b
 
-		consumed, err := HandleBuf(buf[:offt+n], lines)
-		if err != nil {
-			close(lines)
-			_ = eg.Wait()
-			return fmt.Errorf("failed to parse buf: %w", err)
+			copy(buf, prefix)
+			offt := len(prefix)
+			prefix = prefix[:0]
+
+			n, err = file.Read(buf[offt:])
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+			}
+
+			i := bytes.LastIndexByte(buf[:offt+n], endLine)
+			if i != -1 {
+				prefix = append(prefix, buf[i+1:offt+n]...)
+				p.n = i
+			}
+
+			select {
+			case <-ectx.Done():
+				return ectx.Err()
+			case pages <- p:
+			}
 		}
-		copy(buf, buf[consumed:])
-		offt += n - consumed
-		debugf("offt=%d buf: %q\n", offt, buf[:offt])
+	})
+
+	err = eg.Wait()
+	if err != nil {
+		return fmt.Errorf("failed to solve: %w", err)
 	}
 
 	store := MergeStores(stores)
@@ -279,4 +305,9 @@ func Solve(filename string) error {
 }
 
 func main() {
+	filename := os.Args[1]
+	if err := Solve(filename); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to solve: %v\n", err)
+		os.Exit(1)
+	}
 }
