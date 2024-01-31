@@ -16,23 +16,22 @@ import (
 
 // after profiling it appears that strconv.ParseFloat
 // is taking way to much time for our use case
-func ValueToFloat(value []byte) (float64, error) {
-	var f float64
-	var neg bool
+func ParseFloat(value []byte) float64 {
+	const minus = '-'
+	f := 0.0
+	m := 1.0
+	i := 0
+	if value[i] == minus {
+		m = -1.0
+		i++
+	}
 	n := len(value)
-	for _, c := range value[:n-2] {
-		switch c {
-		case '-':
-			neg = true
-		default:
-			f = f*10 + float64(c-'0')
-		}
+	for ; i < n-2; i++ {
+		f *= 10
+		f += float64(value[i] - '0')
 	}
 	f += float64(value[n-1]-'0') / 10
-	if neg {
-		return -f, nil
-	}
-	return f, nil
+	return m * f
 }
 
 const (
@@ -54,7 +53,7 @@ func ParseLine(line []byte) (out Item, err error) {
 	}
 
 	out.name = line[:sep]
-	out.value, err = ValueToFloat(line[sep+1:])
+	out.value = ParseFloat(line[sep+1:])
 	return out, err
 }
 
@@ -101,7 +100,7 @@ type InfoStore struct {
 
 func NewInfoStore() *InfoStore {
 	return &InfoStore{
-		m: make(map[string]*Info, 1e3),
+		m: make(map[string]*Info, 1000),
 	}
 }
 
