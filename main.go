@@ -8,20 +8,31 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strconv"
+	"sort"
 	"sync"
-	"unsafe"
 
 	"golang.org/x/sync/errgroup"
 )
 
-func debugf(format string, args ...any) {
-	// fmt.Printf(format, args...)
-}
-
+// after profiling it appears that strconv.ParseFloat
+// is taking way to much time for our use case
 func ValueToFloat(value []byte) (float64, error) {
-	s := unsafe.String(unsafe.SliceData(value), len(value))
-	return strconv.ParseFloat(s, 64)
+	var f float64
+	var neg bool
+	n := len(value)
+	for _, c := range value[:n-2] {
+		switch c {
+		case '-':
+			neg = true
+		default:
+			f = f*10 + float64(c-'0')
+		}
+	}
+	f += float64(value[n-1]-'0') / 10
+	if neg {
+		return -f, nil
+	}
+	return f, nil
 }
 
 const (
@@ -48,16 +59,14 @@ func ParseLine(line []byte) (out Item, err error) {
 }
 
 type Info struct {
-	Name  string
 	Min   float64
 	Max   float64
 	Sum   float64
 	Count float64
 }
 
-func InfoFromItem(item Item) Info {
-	return Info{
-		Name:  string(item.name),
+func InfoFromItem(item Item) *Info {
+	return &Info{
 		Min:   item.value,
 		Max:   item.value,
 		Sum:   item.value,
@@ -75,7 +84,7 @@ func (info *Info) Update(item Item) {
 	info.Count += 1
 }
 
-func (info *Info) Merge(other Info) {
+func (info *Info) Merge(other *Info) {
 	if info.Min > other.Min {
 		info.Min = other.Min
 	}
@@ -87,43 +96,50 @@ func (info *Info) Merge(other Info) {
 }
 
 type InfoStore struct {
-	m     map[string]int
-	infos []Info
+	m map[string]*Info
 }
 
 func NewInfoStore() *InfoStore {
 	return &InfoStore{
-		m:     make(map[string]int, 1e3),
-		infos: make([]Info, 0, 1e3),
+		m: make(map[string]*Info, 1e3),
 	}
 }
 
-func (store *InfoStore) At(i int) *Info {
-	return &store.infos[i]
-}
-
-func (store *InfoStore) Merge(info Info) {
-	if i, ok := store.m[info.Name]; ok {
-		store.At(i).Merge(info)
+func (store *InfoStore) Merge(name string, other *Info) {
+	if mine, ok := store.m[name]; ok {
+		mine.Merge(other)
 	} else {
-		store.infos = append(store.infos, info)
-		store.m[info.Name] = len(store.infos) - 1
+		store.m[name] = other
 	}
 }
 
 func (store *InfoStore) Update(item Item) {
-	if i, ok := store.m[string(item.name)]; ok {
-		store.At(i).Update(item)
+	if info, ok := store.m[string(item.name)]; ok {
+		info.Update(item)
 	} else {
-		info := InfoFromItem(item)
-		store.infos = append(store.infos, info)
-		store.m[info.Name] = len(store.infos) - 1
+		name := string(item.name)
+		store.m[name] = InfoFromItem(item)
 	}
 }
 
 func (store *InfoStore) Print() {
+	type InfoWithName struct {
+		*Info
+		Name string
+	}
+	l := make([]InfoWithName, 0, len(store.m))
+	for name, info := range store.m {
+		l = append(l, InfoWithName{
+			Info: info,
+			Name: name,
+		})
+	}
+	sort.Slice(l, func(i, j int) bool {
+		return l[i].Name < l[j].Name
+	})
+
 	fmt.Print("{")
-	for i, info := range store.infos {
+	for i, info := range l {
 		if i != 0 {
 			fmt.Print(", ")
 		}
@@ -184,8 +200,8 @@ func DoWork(pages <-chan *Page, store *InfoStore) error {
 func MergeStores(l []*InfoStore) *InfoStore {
 	store := NewInfoStore()
 	for i := range l {
-		for _, info := range l[i].infos {
-			store.Merge(info)
+		for name, info := range l[i].m {
+			store.Merge(name, info)
 		}
 	}
 	return store
