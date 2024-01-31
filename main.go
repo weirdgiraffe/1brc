@@ -2,14 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
+
+	"golang.org/x/sync/errgroup"
 )
 
 func debugf(format string, args ...any) {
@@ -26,7 +31,7 @@ const valueSep = ';'
 var ErrSeparatorNotFound = errors.New("separator not found")
 
 type Item struct {
-	name  string
+	name  []byte
 	value float64
 }
 
@@ -36,7 +41,7 @@ func ParseLine(line []byte) (out Item, err error) {
 		return out, ErrSeparatorNotFound
 	}
 
-	out.name = string(line[:sep])
+	out.name = line[:sep]
 	out.value, err = ValueToFloat(line[sep+1:])
 	return out, err
 }
@@ -51,7 +56,7 @@ type Info struct {
 
 func InfoFromItem(item Item) Info {
 	return Info{
-		Name:  item.name,
+		Name:  string(item.name),
 		Min:   item.value,
 		Max:   item.value,
 		Sum:   item.value,
@@ -69,13 +74,24 @@ func (info *Info) Update(item Item) {
 	info.Count += 1
 }
 
+func (info *Info) Merge(other Info) {
+	if info.Min > other.Min {
+		info.Min = other.Min
+	}
+	if info.Max < other.Max {
+		info.Max = other.Max
+	}
+	info.Sum += other.Sum
+	info.Count += other.Count
+}
+
 type InfoStore struct {
 	infos []Info
 }
 
 func NewInfoStore() *InfoStore {
 	return &InfoStore{
-		infos: make([]Info, 0, 1e4),
+		infos: make([]Info, 0, 1e3),
 	}
 }
 
@@ -83,10 +99,37 @@ func (store *InfoStore) At(i int) *Info {
 	return &store.infos[i]
 }
 
-func (store *InfoStore) Update(item Item) {
+func (store *InfoStore) Merge(info Info) {
 	n := len(store.infos)
 	i := sort.Search(n, func(i int) bool {
-		return strings.Compare(store.At(i).Name, item.name) >= 0
+		return strings.Compare(store.At(i).Name, info.Name) >= 0
+	})
+
+	if i == n {
+		// all items are smaller than item, so add item to the end
+		store.infos = append(store.infos, info)
+		return
+	}
+
+	found := store.At(i)
+	if found.Name == info.Name {
+		found.Merge(info)
+		return
+	}
+
+	// insert item at i
+	store.infos = append(store.infos, Info{})
+	copy(store.infos[i+1:], store.infos[i:n])
+	store.infos[i] = info
+}
+
+func (store *InfoStore) Update(item Item) {
+	n := len(store.infos)
+
+	name := unsafe.String(unsafe.SliceData(item.name), len(item.name))
+
+	i := sort.Search(n, func(i int) bool {
+		return strings.Compare(store.At(i).Name, name) >= 0
 	})
 
 	if i == n {
@@ -97,7 +140,7 @@ func (store *InfoStore) Update(item Item) {
 	}
 
 	found := store.At(i)
-	if found.Name == item.name {
+	if found.Name == name {
 		found.Update(item)
 		return
 	}
@@ -110,6 +153,7 @@ func (store *InfoStore) Update(item Item) {
 }
 
 func (store *InfoStore) Print() {
+	return
 	fmt.Print("{")
 	for i, info := range store.infos {
 		if i != 0 {
@@ -130,56 +174,108 @@ func HandleLine(line []byte, store *InfoStore) error {
 		return fmt.Errorf("failed to parse line: %w", err)
 	}
 	store.Update(item)
+
+	line = line[:0]
+	linePool.Put(&line)
 	return nil
 }
 
-func HandleBuf(buf []byte, store *InfoStore) (consumed int, err error) {
+func DoWork(lines <-chan []byte, store *InfoStore) error {
+	for line := range lines {
+		err := HandleLine(line, store)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var linePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 100)
+		return &b
+	},
+}
+
+func HandleBuf(buf []byte, out chan<- []byte) (consumed int, err error) {
 	for {
 		le := bytes.IndexByte(buf[consumed:], '\n')
 		if le == -1 {
 			debugf("line end not found\n")
 			return consumed, nil
 		}
-		line := buf[consumed : consumed+le]
-		err = HandleLine(line, store)
-		if err != nil {
-			return consumed, fmt.Errorf("failed to parse line %q: %w", line, err)
-		}
+
+		bp := linePool.Get().(*[]byte)
+		b := *bp
+		b = append(b, buf[consumed:consumed+le]...)
+		// b := make([]byte, le)
+		// copy(b, buf[consumed:consumed+le])
+		out <- b
 		consumed += le + 1
 	}
 }
 
-func Solve(filename string) error {
+func MergeStores(l []*InfoStore) *InfoStore {
 	store := NewInfoStore()
+	for i := range l {
+		for _, info := range l[i].infos {
+			store.Merge(info)
+		}
+	}
+	return store
+}
 
+func Solve(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
+	workers := runtime.GOMAXPROCS(-1)
+	lines := make(chan []byte, 1000*workers)
+	eg, _ := errgroup.WithContext(context.Background())
+
+	stores := make([]*InfoStore, workers)
+	for i := 0; i < workers; i++ {
+		store := NewInfoStore()
+		stores[i] = store
+		eg.Go(func() error {
+			return DoWork(lines, store)
+		})
+	}
+
 	pageSize := os.Getpagesize()
 	buf := make([]byte, pageSize)
 	offt := 0
 	for {
-		n, err := file.Read(buf[offt:])
+		var n int
+		n, err = file.Read(buf[offt:])
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				fmt.Printf("store has %d items\n", len(store.infos))
-				store.Print()
-				return nil
+				close(lines)
+				_ = eg.Wait()
+				break
 			}
+			close(lines)
+			_ = eg.Wait()
 			return fmt.Errorf("failed to read file: %w", err)
 		}
 
-		consumed, err := HandleBuf(buf[:offt+n], store)
+		consumed, err := HandleBuf(buf[:offt+n], lines)
 		if err != nil {
+			close(lines)
+			_ = eg.Wait()
 			return fmt.Errorf("failed to parse buf: %w", err)
 		}
 		copy(buf, buf[consumed:])
 		offt += n - consumed
 		debugf("offt=%d buf: %q\n", offt, buf[:offt])
 	}
+
+	store := MergeStores(stores)
+	store.Print()
+	return nil
 }
 
 func main() {
