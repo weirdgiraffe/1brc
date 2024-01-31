@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-const testFile = "../../gunnarmorling/1brc/measurements.txt"
+const testFile = "../../gunnarmorling/1brc/measurements1K.txt"
 
 // on my machine on average it takes 4-5.5 seconds
 // to read the test file
