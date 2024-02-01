@@ -29,8 +29,6 @@ func ParseFloat(value []byte) (f float64) {
 	return m * (f + float64(value[n-1]-'0')/10.0)
 }
 
-const shortLineLen = 200
-
 // bytes.IndexByte seems to have some native implementation
 // so it won't get inlined and is slower based on benchamarks
 func lineEndIndex(b []byte) int {
